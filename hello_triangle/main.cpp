@@ -54,6 +54,9 @@ private:
     GLFWwindow* mWindow;
     VkInstance mInstance;
     VkDebugUtilsMessengerEXT mDebugMessenger;
+    VkPhysicalDevice mPhysicalDevice = VK_NULL_HANDLE;
+    VkDevice mDevice;
+    VkQueue mGraphicsQueue;
 
     bool checkValidationLayerSupport()
     {
@@ -196,7 +199,6 @@ private:
 
     void pickPhysicalDevice()
     {
-        VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
         uint32_t deviceCount = 0;
         vkEnumeratePhysicalDevices(mInstance, &deviceCount, nullptr);
         if (deviceCount == 0) {
@@ -207,12 +209,12 @@ private:
         vkEnumeratePhysicalDevices(mInstance, &deviceCount, devices.data());
         for (const auto& device : devices) {
             if (isDeviceSuitable(device)) {
-                physicalDevice = device;
+                mPhysicalDevice = device;
                 break;
             }
         }
 
-        if (physicalDevice == VK_NULL_HANDLE) {
+        if (mPhysicalDevice == VK_NULL_HANDLE) {
             throw std::runtime_error("Couldn't find a suitable GPU for Vulkan rendering.");
         }
     };
@@ -226,12 +228,14 @@ private:
     struct QueueFamilyIndices {
         std::optional<uint32_t> graphicsFamily;
 
-        bool isComplete() const {
+        bool isComplete() const
+        {
             return graphicsFamily.has_value();
         }
     };
 
-    QueueFamilyIndices findQueueFamilies(VkPhysicalDevice pDevice) {
+    QueueFamilyIndices findQueueFamilies(VkPhysicalDevice pDevice)
+    {
         QueueFamilyIndices indices;
 
         uint32_t queueFamilyCount = 0;
@@ -255,11 +259,50 @@ private:
         return indices;
     }
 
+    void createLogicalDevice()
+    {
+        QueueFamilyIndices indices = findQueueFamilies(mPhysicalDevice);
+
+        VkDeviceQueueCreateInfo queueCreateInfo {};
+        queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        queueCreateInfo.queueFamilyIndex = indices.graphicsFamily.value();
+        queueCreateInfo.queueCount = 1;
+        float queuePriority = 1.0f;
+        queueCreateInfo.pQueuePriorities = &queuePriority;
+
+        VkPhysicalDeviceFeatures deviceFeatures {};
+
+        VkDeviceCreateInfo createInfo{};
+        createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        createInfo.pQueueCreateInfos = &queueCreateInfo;
+        createInfo.queueCreateInfoCount = 1;
+        createInfo.pEnabledFeatures = &deviceFeatures;
+
+        // Per-device validation layers are ignored on recent Vulkan implementations,
+        // but we still need to do set them up for drivers only supporting older Vulkan versions.
+        // <https://www.khronos.org/registry/vulkan/specs/1.3-extensions/html/chap40.html#extendingvulkan-layers-devicelayerdeprecation>
+        createInfo.enabledExtensionCount = 0;
+        if (enableValidationLayers) {
+            createInfo.enabledLayerCount = static_cast<uint32_t>(validationLayers.size());
+            createInfo.ppEnabledLayerNames = validationLayers.data();
+        } else {
+            createInfo.enabledLayerCount = 0;
+        }
+
+        if (vkCreateDevice(mPhysicalDevice, &createInfo, nullptr, &mDevice) != VK_SUCCESS) {
+            throw std::runtime_error("Couldn't create logical Vulkan device.");
+        }
+
+        // We're only creating a single queue from this family, so use index 0.
+        vkGetDeviceQueue(mDevice, indices.graphicsFamily.value(), 0, &mGraphicsQueue);
+    }
+
     void initVulkan()
     {
         createInstance();
         setupDebugMessenger();
         pickPhysicalDevice();
+        createLogicalDevice();
     }
 
     void mainLoop()
@@ -275,6 +318,7 @@ private:
             DestroyDebugUtilsMessengerEXT(mInstance, mDebugMessenger, nullptr);
         }
 
+        vkDestroyDevice(mDevice, nullptr);
         vkDestroyInstance(mInstance, nullptr);
 
         glfwDestroyWindow(mWindow);
