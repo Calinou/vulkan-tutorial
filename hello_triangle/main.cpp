@@ -94,6 +94,7 @@ private:
     std::vector<VkImageView> mSwapChainImageViews;
     VkRenderPass mRenderPass;
     VkPipelineLayout mPipelineLayout;
+    VkPipeline mGraphicsPipeline;
 
     bool checkValidationLayerSupport()
     {
@@ -659,7 +660,9 @@ private:
         VkPipelineViewportStateCreateInfo viewportState {};
         viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
         viewportState.viewportCount = 1;
+        viewportState.pViewports = &viewport;
         viewportState.scissorCount = 1;
+        viewportState.pScissors = &scissor;
 
         VkPipelineRasterizationStateCreateInfo rasterizer {};
         rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
@@ -693,6 +696,32 @@ private:
             throw std::runtime_error("Couldn't create Vulkan pipeline layout.");
         }
 
+        VkGraphicsPipelineCreateInfo pipelineInfo{};
+        pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipelineInfo.stageCount = 2;
+        pipelineInfo.pStages = shaderStages;
+        pipelineInfo.pVertexInputState = &vertexInputInfo;
+        pipelineInfo.pInputAssemblyState = &inputAssembly;
+        pipelineInfo.pViewportState = &viewportState;
+        pipelineInfo.pRasterizationState = &rasterizer;
+        pipelineInfo.pMultisampleState = &multisampling;
+        pipelineInfo.pDepthStencilState = nullptr; // Optional
+        pipelineInfo.pColorBlendState = &colorBlending;
+        pipelineInfo.pDynamicState = &dynamicState;
+
+        pipelineInfo.layout = mPipelineLayout;
+        pipelineInfo.renderPass = mRenderPass;
+        pipelineInfo.subpass = 0;
+
+        pipelineInfo.basePipelineHandle = VK_NULL_HANDLE; // Optional
+        pipelineInfo.basePipelineIndex = -1; // Optional
+
+        if (vkCreateGraphicsPipelines(mDevice, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &mGraphicsPipeline) != VK_SUCCESS) {
+            throw std::runtime_error("Couldn't create Vulkan graphics pipeline.");
+        }
+
+        // Shader modules don't need to exist after the pipeline has been compiled,
+        // so we can destroy them now.
         vkDestroyShaderModule(mDevice, fragShaderModule, nullptr);
         vkDestroyShaderModule(mDevice, vertShaderModule, nullptr);
     }
@@ -725,6 +754,7 @@ private:
 
         // Destroy resources in the opposite order in which they were created.
 
+        vkDestroyPipeline(mDevice, mGraphicsPipeline, nullptr);
         vkDestroyPipelineLayout(mDevice, mPipelineLayout, nullptr);
         vkDestroyRenderPass(mDevice, mRenderPass, nullptr);
         // Swapchain images are automatically cleaned up, but not the image views.
