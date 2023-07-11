@@ -95,6 +95,7 @@ private:
     VkRenderPass mRenderPass;
     VkPipelineLayout mPipelineLayout;
     VkPipeline mGraphicsPipeline;
+    std::vector<VkFramebuffer> mSwapChainFramebuffers;
 
     bool checkValidationLayerSupport()
     {
@@ -726,6 +727,27 @@ private:
         vkDestroyShaderModule(mDevice, vertShaderModule, nullptr);
     }
 
+    void createFramebuffers() {
+        mSwapChainFramebuffers.resize(mSwapChainImageViews.size());
+
+        for (size_t i = 0; i < mSwapChainImageViews.size(); i += 1) {
+            VkImageView attachments[] = { mSwapChainImageViews[i] };
+
+            VkFramebufferCreateInfo framebufferInfo{};
+            framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+            framebufferInfo.renderPass = mRenderPass;
+            framebufferInfo.attachmentCount = 1;
+            framebufferInfo.pAttachments = attachments;
+            framebufferInfo.width = mSwapChainExtent.width;
+            framebufferInfo.height = mSwapChainExtent.height;
+            framebufferInfo.layers = 1;
+
+            if (vkCreateFramebuffer(mDevice, &framebufferInfo, nullptr, &mSwapChainFramebuffers[i]) != VK_SUCCESS) {
+                throw std::runtime_error("Couldn't create Vulkan framebuffer.");
+            }
+        }
+    }
+
     void initVulkan()
     {
         createInstance();
@@ -737,6 +759,7 @@ private:
         createImageViews();
         createRenderPass();
         createGraphicsPipeline();
+        createFramebuffers();
     }
 
     void mainLoop()
@@ -754,6 +777,9 @@ private:
 
         // Destroy resources in the opposite order in which they were created.
 
+        for (auto framebuffer : mSwapChainFramebuffers) {
+            vkDestroyFramebuffer(mDevice, framebuffer, nullptr);
+        }
         vkDestroyPipeline(mDevice, mGraphicsPipeline, nullptr);
         vkDestroyPipelineLayout(mDevice, mPipelineLayout, nullptr);
         vkDestroyRenderPass(mDevice, mRenderPass, nullptr);
