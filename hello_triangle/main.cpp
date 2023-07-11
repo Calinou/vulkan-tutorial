@@ -96,6 +96,8 @@ private:
     VkPipelineLayout mPipelineLayout;
     VkPipeline mGraphicsPipeline;
     std::vector<VkFramebuffer> mSwapChainFramebuffers;
+    VkCommandPool mCommandPool;
+    VkCommandBuffer mCommandBuffer;
 
     bool checkValidationLayerSupport()
     {
@@ -565,8 +567,9 @@ private:
         return shaderModule;
     }
 
-    void createRenderPass() {
-        VkAttachmentDescription colorAttachment{};
+    void createRenderPass()
+    {
+        VkAttachmentDescription colorAttachment {};
         colorAttachment.format = mSwapChainImageFormat;
         colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
 
@@ -579,18 +582,18 @@ private:
         colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
-        VkAttachmentReference colorAttachmentRef{};
+        VkAttachmentReference colorAttachmentRef {};
         colorAttachmentRef.attachment = 0;
         colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
-        VkSubpassDescription subpass{};
+        VkSubpassDescription subpass {};
         subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
         subpass.colorAttachmentCount = 1;
         // The index of the attachment in this array is directly referenced from the fragment shader with the
         // `layout(location = 0) out vec4 outColor` directive.
         subpass.pColorAttachments = &colorAttachmentRef;
 
-        VkRenderPassCreateInfo renderPassInfo{};
+        VkRenderPassCreateInfo renderPassInfo {};
         renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
         renderPassInfo.attachmentCount = 1;
         renderPassInfo.pAttachments = &colorAttachment;
@@ -697,7 +700,7 @@ private:
             throw std::runtime_error("Couldn't create Vulkan pipeline layout.");
         }
 
-        VkGraphicsPipelineCreateInfo pipelineInfo{};
+        VkGraphicsPipelineCreateInfo pipelineInfo {};
         pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
         pipelineInfo.stageCount = 2;
         pipelineInfo.pStages = shaderStages;
@@ -727,13 +730,14 @@ private:
         vkDestroyShaderModule(mDevice, vertShaderModule, nullptr);
     }
 
-    void createFramebuffers() {
+    void createFramebuffers()
+    {
         mSwapChainFramebuffers.resize(mSwapChainImageViews.size());
 
         for (size_t i = 0; i < mSwapChainImageViews.size(); i += 1) {
             VkImageView attachments[] = { mSwapChainImageViews[i] };
 
-            VkFramebufferCreateInfo framebufferInfo{};
+            VkFramebufferCreateInfo framebufferInfo {};
             framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
             framebufferInfo.renderPass = mRenderPass;
             framebufferInfo.attachmentCount = 1;
@@ -745,6 +749,82 @@ private:
             if (vkCreateFramebuffer(mDevice, &framebufferInfo, nullptr, &mSwapChainFramebuffers[i]) != VK_SUCCESS) {
                 throw std::runtime_error("Couldn't create Vulkan framebuffer.");
             }
+        }
+    }
+
+    void createCommandPool()
+    {
+        const QueueFamilyIndices queueFamilyIndices = findQueueFamilies(mPhysicalDevice);
+        VkCommandPoolCreateInfo poolInfo {};
+        poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        poolInfo.queueFamilyIndex = queueFamilyIndices.graphicsFamily.value();
+
+        if (vkCreateCommandPool(mDevice, &poolInfo, nullptr, &mCommandPool) != VK_SUCCESS) {
+            throw std::runtime_error("Couldn't create Vulkan command pool.");
+        }
+    }
+
+    void createCommandBuffer()
+    {
+        VkCommandBufferAllocateInfo allocInfo {};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.commandPool = mCommandPool;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandBufferCount = 1;
+
+        if (vkAllocateCommandBuffers(mDevice, &allocInfo, &mCommandBuffer) != VK_SUCCESS) {
+            throw std::runtime_error("Couldn't allocate Vulkan command buffer.");
+        }
+    }
+
+    void recordCommandBuffer(VkCommandBuffer pCommandBuffer, uint32_t pImageIndex)
+    {
+        VkCommandBufferBeginInfo beginInfo {};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = 0; // Optional
+        beginInfo.pInheritanceInfo = nullptr; // Optional
+
+        if (vkBeginCommandBuffer(mCommandBuffer, &beginInfo) != VK_SUCCESS) {
+            throw std::runtime_error("Couldn't record Vulkan command buffer.");
+        }
+
+        VkRenderPassBeginInfo renderPassInfo {};
+        renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        renderPassInfo.renderPass = mRenderPass;
+        renderPassInfo.framebuffer = mSwapChainFramebuffers[pImageIndex];
+        renderPassInfo.renderArea.offset = { 0, 0 };
+        renderPassInfo.renderArea.extent = mSwapChainExtent;
+
+        VkClearValue clearColor = { { { 0.0f, 0.0f, 0.0f, 1.0f } } };
+        renderPassInfo.clearValueCount = 1;
+        renderPassInfo.pClearValues = &clearColor;
+
+        vkCmdBeginRenderPass(mCommandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+        vkCmdBindPipeline(mCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, mGraphicsPipeline);
+
+        VkViewport viewport {};
+        viewport.x = 0.0f;
+        viewport.y = 0.0f;
+        viewport.width = static_cast<float>(mSwapChainExtent.width);
+        viewport.height = static_cast<float>(mSwapChainExtent.height);
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+        vkCmdSetViewport(mCommandBuffer, 0, 1, &viewport);
+
+        VkRect2D scissor {};
+        scissor.offset = { 0, 0 };
+        scissor.extent = mSwapChainExtent;
+        vkCmdSetScissor(mCommandBuffer, 0, 1, &scissor);
+
+        // Vertex count, instance count, first vertex, first instance.
+        vkCmdDraw(mCommandBuffer, 3, 1, 0, 0);
+
+        vkCmdEndRenderPass(mCommandBuffer);
+
+        if (vkEndCommandBuffer(mCommandBuffer) != VK_SUCCESS) {
+            throw std::runtime_error("Couldn't record Vulkan command buffer.");
         }
     }
 
@@ -760,6 +840,8 @@ private:
         createRenderPass();
         createGraphicsPipeline();
         createFramebuffers();
+        createCommandPool();
+        createCommandBuffer();
     }
 
     void mainLoop()
@@ -777,6 +859,8 @@ private:
 
         // Destroy resources in the opposite order in which they were created.
 
+        // Command buffer is automatically cleaned up, but not the command pool.
+        vkDestroyCommandPool(mDevice, mCommandPool, nullptr);
         for (auto framebuffer : mSwapChainFramebuffers) {
             vkDestroyFramebuffer(mDevice, framebuffer, nullptr);
         }
