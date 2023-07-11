@@ -98,6 +98,9 @@ private:
     std::vector<VkFramebuffer> mSwapChainFramebuffers;
     VkCommandPool mCommandPool;
     VkCommandBuffer mCommandBuffer;
+    VkSemaphore mImageAvailableSemaphore;
+    VkSemaphore mRenderFinishedSemaphore;
+    VkFence mInFlightFence;
 
     bool checkValidationLayerSupport()
     {
@@ -391,7 +394,7 @@ private:
         }
 
         std::cout << "Using FIFO present mode as mailbox is unavailable.\n";
-        return VK_PRESENT_MODE_FIFO_KHR;
+        return VK_PRESENT_MODE_IMMEDIATE_KHR;
     }
 
     VkExtent2D chooseSwapExtent(const VkSurfaceCapabilitiesKHR& pCapabilities)
@@ -599,6 +602,17 @@ private:
         renderPassInfo.pAttachments = &colorAttachment;
         renderPassInfo.subpassCount = 1;
         renderPassInfo.pSubpasses = &subpass;
+
+        VkSubpassDependency dependency {};
+        dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dependency.dstSubpass = 0;
+        dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.srcAccessMask = 0;
+        dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+        renderPassInfo.dependencyCount = 1;
+        renderPassInfo.pDependencies = &dependency;
 
         if (vkCreateRenderPass(mDevice, &renderPassInfo, nullptr, &mRenderPass) != VK_SUCCESS) {
             throw std::runtime_error("Couldn't create Vulkan render pass.");
@@ -828,6 +842,29 @@ private:
         }
     }
 
+    void createSyncObjects()
+    {
+        VkSemaphoreCreateInfo semaphoreInfo {};
+        semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+        VkFenceCreateInfo fenceInfo {};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        // On the first frame we call `drawFrame()`, which immediately waits on
+        // inFlightFence to be signaled. mInFlightFence is only signaled after a
+        // frame has finished rendering, yet since this is the first frame,
+        // there are no previous frames in which to signal the fence! Thus
+        // `vkWaitForFences()` blocks indefinitely, waiting on something which
+        // will never happen.
+        // To avoid this issue, create the fence in the signaled state.
+        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+
+        if (vkCreateSemaphore(mDevice, &semaphoreInfo, nullptr, &mImageAvailableSemaphore) != VK_SUCCESS
+            || vkCreateSemaphore(mDevice, &semaphoreInfo, nullptr, &mRenderFinishedSemaphore) != VK_SUCCESS
+            || vkCreateFence(mDevice, &fenceInfo, nullptr, &mInFlightFence) != VK_SUCCESS) {
+            throw std::runtime_error("Couldn't create Vulkan semaphores or fence.");
+        }
+    }
+
     void initVulkan()
     {
         createInstance();
@@ -842,13 +879,68 @@ private:
         createFramebuffers();
         createCommandPool();
         createCommandBuffer();
+        createSyncObjects();
+    }
+
+    void drawFrame()
+    {
+        vkWaitForFences(mDevice, 1, &mInFlightFence, VK_TRUE, UINT64_MAX);
+        vkResetFences(mDevice, 1, &mInFlightFence);
+
+        uint32_t imageIndex;
+        vkAcquireNextImageKHR(mDevice, mSwapChain, UINT64_MAX, mImageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
+
+        // This makes sure the command buffer is able to be recorded.
+        vkResetCommandBuffer(mCommandBuffer, 0);
+
+        recordCommandBuffer(mCommandBuffer, imageIndex);
+
+        VkSubmitInfo submitInfo {};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+
+        VkSemaphore waitSemaphores[] = { mImageAvailableSemaphore };
+        VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
+        submitInfo.waitSemaphoreCount = 1;
+        submitInfo.pWaitSemaphores = waitSemaphores;
+        submitInfo.pWaitDstStageMask = waitStages;
+
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &mCommandBuffer;
+
+        VkSemaphore signalSemaphores[] = { mRenderFinishedSemaphore };
+        submitInfo.signalSemaphoreCount = 1;
+        submitInfo.pSignalSemaphores = signalSemaphores;
+
+        if (vkQueueSubmit(mGraphicsQueue, 1, &submitInfo, mInFlightFence) != VK_SUCCESS) {
+            throw std::runtime_error("Couldn't submit Vulkan draw command buffer.");
+        }
+
+        VkPresentInfoKHR presentInfo {};
+        presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        presentInfo.waitSemaphoreCount = 1;
+        presentInfo.pWaitSemaphores = signalSemaphores;
+
+        VkSwapchainKHR swapChains[] = { mSwapChain };
+        presentInfo.swapchainCount = 1;
+        presentInfo.pSwapchains = swapChains;
+        presentInfo.pImageIndices = &imageIndex;
+        // `pResults` allows you to specify an array of VkResult values to check
+        // for every individual swap chain if presentation was successful. It's
+        // not necessary if you're only using a single swap chain, because you
+        // can simply use the return value of the present function.
+        presentInfo.pResults = nullptr; // Optional
+
+        vkQueuePresentKHR(mPresentQueue, &presentInfo);
     }
 
     void mainLoop()
     {
         while (!glfwWindowShouldClose(mWindow)) {
             glfwPollEvents();
+            drawFrame();
         }
+
+        vkDeviceWaitIdle(mDevice);
     }
 
     void cleanup()
@@ -859,6 +951,9 @@ private:
 
         // Destroy resources in the opposite order in which they were created.
 
+        vkDestroyFence(mDevice, mInFlightFence, nullptr);
+        vkDestroySemaphore(mDevice, mRenderFinishedSemaphore, nullptr);
+        vkDestroySemaphore(mDevice, mImageAvailableSemaphore, nullptr);
         // Command buffer is automatically cleaned up, but not the command pool.
         vkDestroyCommandPool(mDevice, mCommandPool, nullptr);
         for (auto framebuffer : mSwapChainFramebuffers) {
