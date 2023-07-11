@@ -92,6 +92,7 @@ private:
     VkFormat mSwapChainImageFormat;
     VkExtent2D mSwapChainExtent;
     std::vector<VkImageView> mSwapChainImageViews;
+    VkRenderPass mRenderPass;
     VkPipelineLayout mPipelineLayout;
 
     bool checkValidationLayerSupport()
@@ -562,6 +563,43 @@ private:
         return shaderModule;
     }
 
+    void createRenderPass() {
+        VkAttachmentDescription colorAttachment{};
+        colorAttachment.format = mSwapChainImageFormat;
+        colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+        colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+
+        colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+        VkAttachmentReference colorAttachmentRef{};
+        colorAttachmentRef.attachment = 0;
+        colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1;
+        // The index of the attachment in this array is directly referenced from the fragment shader with the
+        // `layout(location = 0) out vec4 outColor` directive.
+        subpass.pColorAttachments = &colorAttachmentRef;
+
+        VkRenderPassCreateInfo renderPassInfo{};
+        renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        renderPassInfo.attachmentCount = 1;
+        renderPassInfo.pAttachments = &colorAttachment;
+        renderPassInfo.subpassCount = 1;
+        renderPassInfo.pSubpasses = &subpass;
+
+        if (vkCreateRenderPass(mDevice, &renderPassInfo, nullptr, &mRenderPass) != VK_SUCCESS) {
+            throw std::runtime_error("Couldn't create Vulkan render pass.");
+        }
+    }
+
     void createGraphicsPipeline()
     {
         auto vertShaderCode = readFile("build/shader.vert.spv");
@@ -668,6 +706,7 @@ private:
         createLogicalDevice();
         createSwapChain();
         createImageViews();
+        createRenderPass();
         createGraphicsPipeline();
     }
 
@@ -687,6 +726,7 @@ private:
         // Destroy resources in the opposite order in which they were created.
 
         vkDestroyPipelineLayout(mDevice, mPipelineLayout, nullptr);
+        vkDestroyRenderPass(mDevice, mRenderPass, nullptr);
         // Swapchain images are automatically cleaned up, but not the image views.
         for (auto imageView : mSwapChainImageViews) {
             vkDestroyImageView(mDevice, imageView, nullptr);
