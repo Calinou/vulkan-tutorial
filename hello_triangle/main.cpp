@@ -15,6 +15,7 @@
 constexpr const char* APP_NAME = "Hello Triangle";
 constexpr int WINDOW_WIDTH = 800;
 constexpr int WINDOW_HEIGHT = 600;
+constexpr int MAX_FRAMES_IN_FLIGHT = 2;
 
 const std::vector<const char*> validationLayers = {
     "VK_LAYER_KHRONOS_validation",
@@ -97,10 +98,12 @@ private:
     VkPipeline mGraphicsPipeline;
     std::vector<VkFramebuffer> mSwapChainFramebuffers;
     VkCommandPool mCommandPool;
-    VkCommandBuffer mCommandBuffer;
-    VkSemaphore mImageAvailableSemaphore;
-    VkSemaphore mRenderFinishedSemaphore;
-    VkFence mInFlightFence;
+    std::vector<VkCommandBuffer> mCommandBuffers;
+    std::vector<VkSemaphore> mImageAvailableSemaphores;
+    std::vector<VkSemaphore> mRenderFinishedSemaphores;
+    std::vector<VkFence> mInFlightFences;
+    // The current frame index (incremented every drawn frame, wraps around `MAX_FRAMES_IN_FLIGHT`).
+    uint32_t mCurrentFrame = 0;
 
     bool checkValidationLayerSupport()
     {
@@ -394,7 +397,7 @@ private:
         }
 
         std::cout << "Using FIFO present mode as mailbox is unavailable.\n";
-        return VK_PRESENT_MODE_IMMEDIATE_KHR;
+        return VK_PRESENT_MODE_FIFO_KHR;
     }
 
     VkExtent2D chooseSwapExtent(const VkSurfaceCapabilitiesKHR& pCapabilities)
@@ -779,16 +782,17 @@ private:
         }
     }
 
-    void createCommandBuffer()
+    void createCommandBuffers()
     {
+        mCommandBuffers.resize(MAX_FRAMES_IN_FLIGHT);
         VkCommandBufferAllocateInfo allocInfo {};
         allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         allocInfo.commandPool = mCommandPool;
         allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocInfo.commandBufferCount = 1;
+        allocInfo.commandBufferCount = (uint32_t)mCommandBuffers.size();
 
-        if (vkAllocateCommandBuffers(mDevice, &allocInfo, &mCommandBuffer) != VK_SUCCESS) {
-            throw std::runtime_error("Couldn't allocate Vulkan command buffer.");
+        if (vkAllocateCommandBuffers(mDevice, &allocInfo, mCommandBuffers.data()) != VK_SUCCESS) {
+            throw std::runtime_error("Couldn't allocate Vulkan command buffers.");
         }
     }
 
@@ -799,7 +803,7 @@ private:
         beginInfo.flags = 0; // Optional
         beginInfo.pInheritanceInfo = nullptr; // Optional
 
-        if (vkBeginCommandBuffer(mCommandBuffer, &beginInfo) != VK_SUCCESS) {
+        if (vkBeginCommandBuffer(pCommandBuffer, &beginInfo) != VK_SUCCESS) {
             throw std::runtime_error("Couldn't record Vulkan command buffer.");
         }
 
@@ -814,9 +818,9 @@ private:
         renderPassInfo.clearValueCount = 1;
         renderPassInfo.pClearValues = &clearColor;
 
-        vkCmdBeginRenderPass(mCommandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBeginRenderPass(pCommandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
-        vkCmdBindPipeline(mCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, mGraphicsPipeline);
+        vkCmdBindPipeline(pCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, mGraphicsPipeline);
 
         VkViewport viewport {};
         viewport.x = 0.0f;
@@ -825,31 +829,34 @@ private:
         viewport.height = static_cast<float>(mSwapChainExtent.height);
         viewport.minDepth = 0.0f;
         viewport.maxDepth = 1.0f;
-        vkCmdSetViewport(mCommandBuffer, 0, 1, &viewport);
+        vkCmdSetViewport(pCommandBuffer, 0, 1, &viewport);
 
         VkRect2D scissor {};
         scissor.offset = { 0, 0 };
         scissor.extent = mSwapChainExtent;
-        vkCmdSetScissor(mCommandBuffer, 0, 1, &scissor);
+        vkCmdSetScissor(pCommandBuffer, 0, 1, &scissor);
 
         // Vertex count, instance count, first vertex, first instance.
-        vkCmdDraw(mCommandBuffer, 3, 1, 0, 0);
+        vkCmdDraw(pCommandBuffer, 3, 1, 0, 0);
 
-        vkCmdEndRenderPass(mCommandBuffer);
+        vkCmdEndRenderPass(pCommandBuffer);
 
-        if (vkEndCommandBuffer(mCommandBuffer) != VK_SUCCESS) {
+        if (vkEndCommandBuffer(pCommandBuffer) != VK_SUCCESS) {
             throw std::runtime_error("Couldn't record Vulkan command buffer.");
         }
     }
 
     void createSyncObjects()
     {
+        mImageAvailableSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
+        mRenderFinishedSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
         VkSemaphoreCreateInfo semaphoreInfo {};
         semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
 
+        mInFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
         VkFenceCreateInfo fenceInfo {};
         fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        // On the first frame we call `drawFrame()`, which immediately waits on
+        // On the first frame, we call `drawFrame()`, which immediately waits on
         // inFlightFence to be signaled. mInFlightFence is only signaled after a
         // frame has finished rendering, yet since this is the first frame,
         // there are no previous frames in which to signal the fence! Thus
@@ -858,10 +865,12 @@ private:
         // To avoid this issue, create the fence in the signaled state.
         fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
-        if (vkCreateSemaphore(mDevice, &semaphoreInfo, nullptr, &mImageAvailableSemaphore) != VK_SUCCESS
-            || vkCreateSemaphore(mDevice, &semaphoreInfo, nullptr, &mRenderFinishedSemaphore) != VK_SUCCESS
-            || vkCreateFence(mDevice, &fenceInfo, nullptr, &mInFlightFence) != VK_SUCCESS) {
-            throw std::runtime_error("Couldn't create Vulkan semaphores or fence.");
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i += 1) {
+            if (vkCreateSemaphore(mDevice, &semaphoreInfo, nullptr, &mImageAvailableSemaphores[i]) != VK_SUCCESS
+                || vkCreateSemaphore(mDevice, &semaphoreInfo, nullptr, &mRenderFinishedSemaphores[i]) != VK_SUCCESS
+                || vkCreateFence(mDevice, &fenceInfo, nullptr, &mInFlightFences[i]) != VK_SUCCESS) {
+                throw std::runtime_error("Couldn't create Vulkan semaphores or fence.");
+            }
         }
     }
 
@@ -878,40 +887,40 @@ private:
         createGraphicsPipeline();
         createFramebuffers();
         createCommandPool();
-        createCommandBuffer();
+        createCommandBuffers();
         createSyncObjects();
     }
 
     void drawFrame()
     {
-        vkWaitForFences(mDevice, 1, &mInFlightFence, VK_TRUE, UINT64_MAX);
-        vkResetFences(mDevice, 1, &mInFlightFence);
+        vkWaitForFences(mDevice, 1, &mInFlightFences[mCurrentFrame], VK_TRUE, UINT64_MAX);
+        vkResetFences(mDevice, 1, &mInFlightFences[mCurrentFrame]);
 
         uint32_t imageIndex;
-        vkAcquireNextImageKHR(mDevice, mSwapChain, UINT64_MAX, mImageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
+        vkAcquireNextImageKHR(mDevice, mSwapChain, UINT64_MAX, mImageAvailableSemaphores[mCurrentFrame], VK_NULL_HANDLE, &imageIndex);
 
         // This makes sure the command buffer is able to be recorded.
-        vkResetCommandBuffer(mCommandBuffer, 0);
+        vkResetCommandBuffer(mCommandBuffers[mCurrentFrame], 0);
 
-        recordCommandBuffer(mCommandBuffer, imageIndex);
+        recordCommandBuffer(mCommandBuffers[mCurrentFrame], imageIndex);
 
         VkSubmitInfo submitInfo {};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 
-        VkSemaphore waitSemaphores[] = { mImageAvailableSemaphore };
+        VkSemaphore waitSemaphores[] = { mImageAvailableSemaphores[mCurrentFrame] };
         VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
         submitInfo.waitSemaphoreCount = 1;
         submitInfo.pWaitSemaphores = waitSemaphores;
         submitInfo.pWaitDstStageMask = waitStages;
 
         submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &mCommandBuffer;
+        submitInfo.pCommandBuffers = &mCommandBuffers[mCurrentFrame];
 
-        VkSemaphore signalSemaphores[] = { mRenderFinishedSemaphore };
+        VkSemaphore signalSemaphores[] = { mRenderFinishedSemaphores[mCurrentFrame] };
         submitInfo.signalSemaphoreCount = 1;
         submitInfo.pSignalSemaphores = signalSemaphores;
 
-        if (vkQueueSubmit(mGraphicsQueue, 1, &submitInfo, mInFlightFence) != VK_SUCCESS) {
+        if (vkQueueSubmit(mGraphicsQueue, 1, &submitInfo, mInFlightFences[mCurrentFrame]) != VK_SUCCESS) {
             throw std::runtime_error("Couldn't submit Vulkan draw command buffer.");
         }
 
@@ -931,6 +940,8 @@ private:
         presentInfo.pResults = nullptr; // Optional
 
         vkQueuePresentKHR(mPresentQueue, &presentInfo);
+
+        mCurrentFrame = (mCurrentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
 
     void mainLoop()
@@ -951,10 +962,12 @@ private:
 
         // Destroy resources in the opposite order in which they were created.
 
-        vkDestroyFence(mDevice, mInFlightFence, nullptr);
-        vkDestroySemaphore(mDevice, mRenderFinishedSemaphore, nullptr);
-        vkDestroySemaphore(mDevice, mImageAvailableSemaphore, nullptr);
-        // Command buffer is automatically cleaned up, but not the command pool.
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i += 1) {
+            vkDestroyFence(mDevice, mInFlightFences[i], nullptr);
+            vkDestroySemaphore(mDevice, mRenderFinishedSemaphores[i], nullptr);
+            vkDestroySemaphore(mDevice, mImageAvailableSemaphores[i], nullptr);
+        }
+        // Command buffers are automatically cleaned up, but not the command pool.
         vkDestroyCommandPool(mDevice, mCommandPool, nullptr);
         for (auto framebuffer : mSwapChainFramebuffers) {
             vkDestroyFramebuffer(mDevice, framebuffer, nullptr);
