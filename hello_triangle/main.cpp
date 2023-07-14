@@ -104,6 +104,7 @@ private:
     std::vector<VkFence> mInFlightFences;
     // The current frame index (incremented every drawn frame, wraps around `MAX_FRAMES_IN_FLIGHT`).
     uint32_t mCurrentFrame = 0;
+    bool mFramebufferResized = false;
 
     bool checkValidationLayerSupport()
     {
@@ -141,9 +142,15 @@ private:
     {
         glfwInit();
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 
         mWindow = glfwCreateWindow(WINDOW_WIDTH, WINDOW_HEIGHT, APP_NAME, nullptr, nullptr);
+        glfwSetWindowUserPointer(mWindow, this);
+        glfwSetFramebufferSizeCallback(mWindow, framebufferResizeCallback);
+    }
+
+    static void framebufferResizeCallback(GLFWwindow* window, int width, int height) {
+        auto app = reinterpret_cast<HelloTriangleApplication*>(glfwGetWindowUserPointer(window));
+        app->mFramebufferResized = true;
     }
 
     void createInstance()
@@ -397,7 +404,7 @@ private:
         }
 
         std::cout << "Using FIFO present mode as mailbox is unavailable.\n";
-        return VK_PRESENT_MODE_FIFO_KHR;
+        return VK_PRESENT_MODE_IMMEDIATE_KHR;
     }
 
     VkExtent2D chooseSwapExtent(const VkSurfaceCapabilitiesKHR& pCapabilities)
@@ -528,6 +535,39 @@ private:
         vkGetSwapchainImagesKHR(mDevice, mSwapChain, &imageCount, nullptr);
         mSwapChainImages.resize(imageCount);
         vkGetSwapchainImagesKHR(mDevice, mSwapChain, &imageCount, mSwapChainImages.data());
+    }
+
+    void cleanupSwapChain()
+    {
+        for (auto framebuffer : mSwapChainFramebuffers) {
+            vkDestroyFramebuffer(mDevice, framebuffer, nullptr);
+        }
+
+        // Swapchain images are automatically cleaned up, but not the image views.
+        for (auto imageView : mSwapChainImageViews) {
+            vkDestroyImageView(mDevice, imageView, nullptr);
+        }
+
+        vkDestroySwapchainKHR(mDevice, mSwapChain, nullptr);
+    }
+
+    void recreateSwapChain()
+    {
+        int width = 0, height = 0;
+        glfwGetFramebufferSize(mWindow, &width, &height);
+        while (width == 0 || height == 0) {
+            // Wait if window is minimized.
+            glfwGetFramebufferSize(mWindow, &width, &height);
+            glfwWaitEvents();
+        }
+
+        vkDeviceWaitIdle(mDevice);
+
+        cleanupSwapChain();
+
+        createSwapChain();
+        createImageViews();
+        createFramebuffers();
     }
 
     void createImageViews()
@@ -894,10 +934,21 @@ private:
     void drawFrame()
     {
         vkWaitForFences(mDevice, 1, &mInFlightFences[mCurrentFrame], VK_TRUE, UINT64_MAX);
-        vkResetFences(mDevice, 1, &mInFlightFences[mCurrentFrame]);
 
         uint32_t imageIndex;
-        vkAcquireNextImageKHR(mDevice, mSwapChain, UINT64_MAX, mImageAvailableSemaphores[mCurrentFrame], VK_NULL_HANDLE, &imageIndex);
+        const VkResult acquireResult = vkAcquireNextImageKHR(mDevice, mSwapChain, UINT64_MAX, mImageAvailableSemaphores[mCurrentFrame], VK_NULL_HANDLE, &imageIndex);
+
+        if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
+            mFramebufferResized = false;
+            recreateSwapChain();
+            return;
+        } else if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR) {
+            throw std::runtime_error("Couldn't acquire Vulkan swapchain image.");
+        }
+
+        // Only reset the frame if we are submitting work to prevent deadlocks
+        // when recreating the swapchain.
+        vkResetFences(mDevice, 1, &mInFlightFences[mCurrentFrame]);
 
         // This makes sure the command buffer is able to be recorded.
         vkResetCommandBuffer(mCommandBuffers[mCurrentFrame], 0);
@@ -939,7 +990,12 @@ private:
         // can simply use the return value of the present function.
         presentInfo.pResults = nullptr; // Optional
 
-        vkQueuePresentKHR(mPresentQueue, &presentInfo);
+        const VkResult presentResult = vkQueuePresentKHR(mPresentQueue, &presentInfo);
+        if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR) {
+            recreateSwapChain();
+        } else if (presentResult != VK_SUCCESS) {
+            throw std::runtime_error("Couldn't present Vulkan swap chain image.");
+        }
 
         mCurrentFrame = (mCurrentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
@@ -956,31 +1012,28 @@ private:
 
     void cleanup()
     {
-        if (enableValidationLayers) {
-            DestroyDebugUtilsMessengerEXT(mInstance, mDebugMessenger, nullptr);
-        }
+        cleanupSwapChain();
 
-        // Destroy resources in the opposite order in which they were created.
+        vkDestroyPipeline(mDevice, mGraphicsPipeline, nullptr);
+        vkDestroyPipelineLayout(mDevice, mPipelineLayout, nullptr);
+
+        vkDestroyRenderPass(mDevice, mRenderPass, nullptr);
 
         for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i += 1) {
             vkDestroyFence(mDevice, mInFlightFences[i], nullptr);
             vkDestroySemaphore(mDevice, mRenderFinishedSemaphores[i], nullptr);
             vkDestroySemaphore(mDevice, mImageAvailableSemaphores[i], nullptr);
         }
+
         // Command buffers are automatically cleaned up, but not the command pool.
         vkDestroyCommandPool(mDevice, mCommandPool, nullptr);
-        for (auto framebuffer : mSwapChainFramebuffers) {
-            vkDestroyFramebuffer(mDevice, framebuffer, nullptr);
-        }
-        vkDestroyPipeline(mDevice, mGraphicsPipeline, nullptr);
-        vkDestroyPipelineLayout(mDevice, mPipelineLayout, nullptr);
-        vkDestroyRenderPass(mDevice, mRenderPass, nullptr);
-        // Swapchain images are automatically cleaned up, but not the image views.
-        for (auto imageView : mSwapChainImageViews) {
-            vkDestroyImageView(mDevice, imageView, nullptr);
-        }
-        vkDestroySwapchainKHR(mDevice, mSwapChain, nullptr);
+
         vkDestroyDevice(mDevice, nullptr);
+
+        if (enableValidationLayers) {
+            DestroyDebugUtilsMessengerEXT(mInstance, mDebugMessenger, nullptr);
+        }
+
         vkDestroySurfaceKHR(mInstance, mSurface, nullptr);
         vkDestroyInstance(mInstance, nullptr);
 
