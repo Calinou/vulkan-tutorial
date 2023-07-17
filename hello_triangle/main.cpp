@@ -107,6 +107,8 @@ private:
     std::vector<VkFence> mInFlightFences;
     VkBuffer mVertexBuffer;
     VkDeviceMemory mVertexBufferMemory;
+    VkBuffer mIndexBuffer;
+    VkDeviceMemory mIndexBufferMemory;
 
     // The current frame index (incremented every drawn frame, wraps around `MAX_FRAMES_IN_FLIGHT`).
     uint32_t mCurrentFrame = 0;
@@ -144,9 +146,19 @@ private:
     };
 
     const std::vector<Vertex> vertices = {
-        { { 0.0f, -0.5f }, { 1.0f, 0.0f, 0.0f } },
-        { { 0.5f, 0.5f }, { 0.0f, 1.0f, 0.0f } },
-        { { -0.5f, 0.5f }, { 0.0f, 0.0f, 1.0f } },
+        { { -0.5f, -0.5f }, { 1.0f, 0.0f, 0.0f } },
+        { { 0.5f, -0.5f }, { 0.0f, 1.0f, 0.0f } },
+        { { 0.5f, 0.5f }, { 0.0f, 0.0f, 1.0f } },
+        { { -0.5f, 0.5f }, { 1.0f, 1.0f, 1.0f } },
+    };
+
+    const std::vector<uint16_t> indices = {
+        0,
+        1,
+        2,
+        2,
+        3,
+        0,
     };
 
     bool checkValidationLayerSupport()
@@ -921,7 +933,7 @@ private:
 
     void copyBuffer(VkBuffer pSrcBuffer, VkBuffer pDstBuffer, VkDeviceSize pSize)
     {
-        VkCommandBufferAllocateInfo allocInfo{};
+        VkCommandBufferAllocateInfo allocInfo {};
         allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         allocInfo.commandPool = mCommandPool;
@@ -930,12 +942,12 @@ private:
         VkCommandBuffer commandBuffer;
         vkAllocateCommandBuffers(mDevice, &allocInfo, &commandBuffer);
 
-        VkCommandBufferBeginInfo beginInfo{};
+        VkCommandBufferBeginInfo beginInfo {};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(commandBuffer, &beginInfo);
 
-        VkBufferCopy copyRegion{};
+        VkBufferCopy copyRegion {};
         copyRegion.srcOffset = 0; // Optional
         copyRegion.dstOffset = 0; // Optional
         copyRegion.size = pSize;
@@ -943,7 +955,7 @@ private:
 
         vkEndCommandBuffer(commandBuffer);
 
-        VkSubmitInfo submitInfo{};
+        VkSubmitInfo submitInfo {};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &commandBuffer;
@@ -979,8 +991,40 @@ private:
             mVertexBuffer,
             mVertexBufferMemory);
 
-        // mVertexBuffer is device-local, so we can't use `vkMapMemory()`.
+        // `mVertexBuffer` is device-local, so we can't use `vkMapMemory()`.
         copyBuffer(stagingBuffer, mVertexBuffer, bufferSize);
+
+        vkDestroyBuffer(mDevice, stagingBuffer, nullptr);
+        vkFreeMemory(mDevice, stagingBufferMemory, nullptr);
+    }
+
+    void createIndexBuffer()
+    {
+        VkDeviceSize bufferSize = sizeof(indices[0]) * indices.size();
+
+        // Use staging memory to improve performance, then transfer it from the CPU to the GPU.
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingBufferMemory;
+        createBuffer(bufferSize,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            stagingBuffer,
+            stagingBufferMemory);
+
+        void* data;
+        vkMapMemory(mDevice, stagingBufferMemory, 0, bufferSize, 0, &data);
+        memcpy(data, indices.data(), (size_t)bufferSize);
+        vkUnmapMemory(mDevice, stagingBufferMemory);
+
+        createBuffer(
+            bufferSize,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            mIndexBuffer,
+            mIndexBufferMemory);
+
+        // `mIndexBuffer` is device-local, so we can't use `vkMapMemory()`.
+        copyBuffer(stagingBuffer, mIndexBuffer, bufferSize);
 
         vkDestroyBuffer(mDevice, stagingBuffer, nullptr);
         vkFreeMemory(mDevice, stagingBufferMemory, nullptr);
@@ -1044,9 +1088,10 @@ private:
         VkBuffer vertexBuffers[] = { mVertexBuffer };
         VkDeviceSize offsets[] = { 0 };
         vkCmdBindVertexBuffers(pCommandBuffer, 0, 1, vertexBuffers, offsets);
+        vkCmdBindIndexBuffer(pCommandBuffer, mIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
 
-        // Command buffer, vertex count, instance count, first vertex, first instance.
-        vkCmdDraw(pCommandBuffer, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
+        // Command buffer, index count, instance count, index buffer offset, index offset, instance offset.
+        vkCmdDrawIndexed(pCommandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
 
         vkCmdEndRenderPass(pCommandBuffer);
 
@@ -1097,6 +1142,7 @@ private:
         createFramebuffers();
         createCommandPool();
         createVertexBuffer();
+        createIndexBuffer();
         createCommandBuffers();
         createSyncObjects();
     }
@@ -1184,8 +1230,11 @@ private:
     {
         cleanupSwapChain();
 
-        vkDestroyBuffer(mDevice, mVertexBuffer, nullptr);
+        vkDestroyBuffer(mDevice, mIndexBuffer, nullptr);
         // Memory must be freed *after* destroying the buffer.
+        vkFreeMemory(mDevice, mIndexBufferMemory, nullptr);
+
+        vkDestroyBuffer(mDevice, mVertexBuffer, nullptr);
         vkFreeMemory(mDevice, mVertexBufferMemory, nullptr);
 
         vkDestroyPipeline(mDevice, mGraphicsPipeline, nullptr);
