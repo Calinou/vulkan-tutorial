@@ -194,6 +194,7 @@ private:
     VkBuffer mIndexBuffer;
     VkDeviceMemory mIndexBufferMemory;
 
+    uint32_t mMipLevels;
     VkImage mTextureImage;
     VkDeviceMemory mTextureImageMemory;
     VkImageView mTextureImageView;
@@ -691,7 +692,7 @@ private:
         mSwapChainImageViews.resize(mSwapChainImages.size());
 
         for (size_t i = 0; i < mSwapChainImages.size(); i += 1) {
-            mSwapChainImageViews[i] = createImageView(mSwapChainImages[i], mSwapChainImageFormat, VK_IMAGE_ASPECT_COLOR_BIT);
+            mSwapChainImageViews[i] = createImageView(mSwapChainImages[i], mSwapChainImageFormat, VK_IMAGE_ASPECT_COLOR_BIT, 1);
         }
     }
 
@@ -1023,8 +1024,8 @@ private:
     void createDepthResources()
     {
         const VkFormat depthFormat = findDepthFormat();
-        createImage(mSwapChainExtent.width, mSwapChainExtent.height, depthFormat, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, mDepthImage, mDepthImageMemory);
-        mDepthImageView = createImageView(mDepthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
+        createImage(mSwapChainExtent.width, mSwapChainExtent.height, 1, depthFormat, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, mDepthImage, mDepthImageMemory);
+        mDepthImageView = createImageView(mDepthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT, 1);
         // That's it for creating the depth image. We don't need to map it or
         // copy another image to it, because we're going to clear it at the
         // start of the render pass like the color attachment.
@@ -1033,6 +1034,7 @@ private:
     void createImage(
         uint32_t pWidth,
         uint32_t pHeight,
+        uint32_t pMipLevels,
         VkFormat pFormat,
         VkImageTiling pTiling,
         VkImageUsageFlags pUsage,
@@ -1046,7 +1048,7 @@ private:
         imageInfo.extent.width = pWidth;
         imageInfo.extent.height = pHeight;
         imageInfo.extent.depth = 1;
-        imageInfo.mipLevels = 1;
+        imageInfo.mipLevels = pMipLevels;
         imageInfo.arrayLayers = 1;
         imageInfo.format = pFormat;
         imageInfo.tiling = pTiling;
@@ -1074,11 +1076,110 @@ private:
         vkBindImageMemory(mDevice, pImage, pImageMemory, 0);
     }
 
+    void generateMipmaps(VkImage pImage, VkFormat pImageFormat, int32_t pTexWidth, int32_t pTexHeight, uint32_t pMipLevels)
+    {
+        // Check if image format supports linear blitting.
+        VkFormatProperties formatProperties;
+        vkGetPhysicalDeviceFormatProperties(mPhysicalDevice, pImageFormat, &formatProperties);
+        if (!(formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) {
+            throw std::runtime_error("Vulkan texture image format doesn't support linear blitting.");
+        }
+
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        VkImageMemoryBarrier barrier {};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.image = pImage;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+        barrier.subresourceRange.levelCount = 1;
+
+        int32_t mipWidth = pTexWidth;
+        int32_t mipHeight = pTexHeight;
+
+        for (uint32_t i = 1; i < pMipLevels; i += 1) {
+            // First, we transition level i - 1 to `VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL`.
+            // This transition will wait for level i - 1 to be filled, either
+            // from the previous blit command, or from `vkCmdCopyBufferToImage()`.
+            // The current blit command will wait on this transition.
+            barrier.subresourceRange.baseMipLevel = i - 1;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+            vkCmdPipelineBarrier(
+                commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+            VkImageBlit blit {};
+            blit.srcOffsets[0] = { 0, 0, 0 };
+            blit.srcOffsets[1] = { mipWidth, mipHeight, 1 };
+            blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            blit.srcSubresource.mipLevel = i - 1;
+            blit.srcSubresource.baseArrayLayer = 0;
+            blit.srcSubresource.layerCount = 1;
+            blit.dstOffsets[0] = { 0, 0, 0 };
+            blit.dstOffsets[1] = {
+                mipWidth > 1 ? mipWidth / 2 : 1,
+                mipHeight > 1 ? mipHeight / 2 : 1,
+                1,
+            };
+            blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            blit.dstSubresource.mipLevel = i;
+            blit.dstSubresource.baseArrayLayer = 0;
+            blit.dstSubresource.layerCount = 1;
+
+            vkCmdBlitImage(
+                commandBuffer, pImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, pImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+
+            // This barrier transitions mip level i - 1 to `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`.
+            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+            vkCmdPipelineBarrier(
+                commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+            if (mipWidth > 1) {
+                mipWidth /= 2;
+            }
+
+            if (mipHeight > 1) {
+                mipHeight /= 2;
+            }
+        }
+
+        // This barrier transitions the last mip level from
+        // `VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL` to
+        // `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`. This wasn't handled by
+        // the loop, since the last mip level is never blitted from.
+        barrier.subresourceRange.baseMipLevel = pMipLevels - 1;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+        vkCmdPipelineBarrier(
+            commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+        endSingleTimeCommands(commandBuffer);
+    }
+
     void createTextureImage()
     {
         int texWidth, texHeight, texChannels;
         stbi_uc* pixels = stbi_load(TEXTURE_PATH, &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
         VkDeviceSize imageSize = texWidth * texHeight * 4;
+
+        // The max function selects the largest dimension. The log2 function
+        // calculates how many times that dimension can be divided by 2. The
+        // floor function handles cases where the largest dimension is not a
+        // power of 2. 1 is added so that the original image has a mip level.
+        mMipLevels = static_cast<uint32_t>(std::floor(std::log2(std::max(texWidth, texHeight)))) + 1;
 
         if (!pixels) {
             throw std::runtime_error("Couldn't load image.");
@@ -1094,20 +1195,22 @@ private:
         vkUnmapMemory(mDevice, stagingBufferMemory);
         stbi_image_free(pixels);
 
-        createImage(texWidth, texHeight, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT, mTextureImage, mTextureImageMemory);
+        // Mipmap generation requires `VK_IMAGE_USAGE_TRANSFER_SRC_BIT`.
+        createImage(texWidth, texHeight, mMipLevels, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT, mTextureImage, mTextureImageMemory);
 
-        transitionImageLayout(mTextureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        transitionImageLayout(mTextureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mMipLevels);
 
         copyBufferToImage(stagingBuffer, mTextureImage, static_cast<uint32_t>(texWidth), static_cast<uint32_t>(texHeight));
 
-        // Perform another transition to prepare the texture image for shader access.
-        transitionImageLayout(mTextureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        // Image is transitioned to `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL` while generating mipmaps.
 
         vkDestroyBuffer(mDevice, stagingBuffer, nullptr);
         vkFreeMemory(mDevice, stagingBufferMemory, nullptr);
+
+        generateMipmaps(mTextureImage, VK_FORMAT_R8G8B8A8_SRGB, texWidth, texHeight, mMipLevels);
     }
 
-    VkImageView createImageView(VkImage pImage, VkFormat pFormat, VkImageAspectFlags pAspectFlags)
+    VkImageView createImageView(VkImage pImage, VkFormat pFormat, VkImageAspectFlags pAspectFlags, uint32_t pMipLevels)
     {
         VkImageViewCreateInfo viewInfo {};
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -1122,7 +1225,7 @@ private:
 
         viewInfo.subresourceRange.aspectMask = pAspectFlags;
         viewInfo.subresourceRange.baseMipLevel = 0;
-        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.levelCount = pMipLevels;
         viewInfo.subresourceRange.baseArrayLayer = 0;
         viewInfo.subresourceRange.layerCount = 1;
 
@@ -1136,7 +1239,7 @@ private:
 
     void createTextureImageView()
     {
-        mTextureImageView = createImageView(mTextureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_ASPECT_COLOR_BIT);
+        mTextureImageView = createImageView(mTextureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_ASPECT_COLOR_BIT, mMipLevels);
     }
 
     void createTextureSampler()
@@ -1157,9 +1260,9 @@ private:
         samplerInfo.compareEnable = VK_FALSE;
         samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
         samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-        samplerInfo.mipLodBias = 0.0f;
         samplerInfo.minLod = 0.0f;
-        samplerInfo.maxLod = 0.0f;
+        samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
+        samplerInfo.mipLodBias = 0.0f;
 
         if (vkCreateSampler(mDevice, &samplerInfo, nullptr, &mTextureSampler) != VK_SUCCESS) {
             throw std::runtime_error("Couldn't create Vulkan texture sampler.");
@@ -1238,7 +1341,7 @@ private:
         endSingleTimeCommands(commandBuffer);
     }
 
-    void transitionImageLayout(VkImage pImage, VkFormat pFormat, VkImageLayout pOldLayout, VkImageLayout pNewLayout)
+    void transitionImageLayout(VkImage pImage, VkFormat pFormat, VkImageLayout pOldLayout, VkImageLayout pNewLayout, uint32_t pMipLevels)
     {
         VkCommandBuffer commandBuffer = beginSingleTimeCommands();
 
@@ -1254,7 +1357,7 @@ private:
         barrier.image = pImage;
         barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         barrier.subresourceRange.baseMipLevel = 0;
-        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.levelCount = pMipLevels;
         barrier.subresourceRange.baseArrayLayer = 0;
         barrier.subresourceRange.layerCount = 1;
 
@@ -1684,7 +1787,7 @@ private:
         float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
 
         UniformBufferObject ubo = {
-            .model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f)),
+            .model = glm::rotate(glm::mat4(1.0f), time * glm::radians(0.0f), glm::vec3(0.0f, 0.0f, 1.0f)),
             .view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f)),
             .projection = glm::perspective(glm::radians(45.0f), mSwapChainExtent.width / (float)mSwapChainExtent.height, 0.01f, 10.0f),
         };
