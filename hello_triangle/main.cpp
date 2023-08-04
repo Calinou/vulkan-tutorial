@@ -9,7 +9,11 @@
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
+
+#define TINYOBJLOADER_IMPLEMENTATION
+#include "thirdparty/tinyobjloader/tiny_obj_loader.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "thirdparty/stb/stb_image.h"
@@ -19,13 +23,17 @@
 
 #define GLM_FORCE_RADIANS
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE // Use Vulkan depth range instead of OpenGL's.
+#define GLM_ENABLE_EXPERIMENTAL // Required for hash functions.
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtx/hash.hpp>
 
 constexpr const char* APP_NAME = "Hello Triangle";
 constexpr int WINDOW_WIDTH = 800;
 constexpr int WINDOW_HEIGHT = 600;
 constexpr int MAX_FRAMES_IN_FLIGHT = 2;
+constexpr const char* MODEL_PATH = "viking_room.obj";
+constexpr const char* TEXTURE_PATH = "viking_room.png";
 
 const std::vector<const char*> validationLayers = {
     "VK_LAYER_KHRONOS_validation",
@@ -79,6 +87,63 @@ void DestroyDebugUtilsMessengerEXT(VkInstance pInstance, VkDebugUtilsMessengerEX
     }
 };
 
+struct Vertex {
+    glm::vec3 position;
+    glm::vec3 color;
+    glm::vec2 texCoord;
+
+    static VkVertexInputBindingDescription getBindingDescription()
+    {
+        VkVertexInputBindingDescription bindingDescription {};
+        bindingDescription.binding = 0;
+        bindingDescription.stride = sizeof(Vertex);
+        bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+        return bindingDescription;
+    }
+
+    static std::array<VkVertexInputAttributeDescription, 3> getAttributeDescriptions()
+    {
+        std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions {};
+
+        attributeDescriptions[0].binding = 0;
+        attributeDescriptions[0].location = 0;
+        attributeDescriptions[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attributeDescriptions[0].offset = offsetof(Vertex, position);
+
+        attributeDescriptions[1].binding = 0;
+        attributeDescriptions[1].location = 1;
+        attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attributeDescriptions[1].offset = offsetof(Vertex, color);
+
+        attributeDescriptions[2].binding = 0;
+        attributeDescriptions[2].location = 2;
+        attributeDescriptions[2].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[2].offset = offsetof(Vertex, texCoord);
+
+        return attributeDescriptions;
+    }
+
+    bool operator==(const Vertex& pOther) const
+    {
+        return position == pOther.position && color == pOther.color && texCoord == pOther.texCoord;
+    }
+};
+
+namespace std {
+template <>
+struct hash<Vertex> {
+    // Hash functions are a complex topic, but cppreference.com recommends the
+    // following approach combining the fields of a struct to create a decent
+    // quality hash function:
+    size_t operator()(Vertex const& pVertex) const
+    {
+        return ((hash<glm::vec3>()(pVertex.position) ^ (hash<glm::vec3>()(pVertex.color) << 1)) >> 1)
+            ^ (hash<glm::vec2>()(pVertex.texCoord) << 1);
+    }
+};
+}
+
 class HelloTriangleApplication {
 public:
     void run()
@@ -90,6 +155,12 @@ public:
     }
 
 private:
+    struct UniformBufferObject {
+        glm::mat4 model;
+        glm::mat4 view;
+        glm::mat4 projection;
+    };
+
     GLFWwindow* mWindow;
     VkInstance mInstance;
     VkDebugUtilsMessengerEXT mDebugMessenger;
@@ -116,6 +187,8 @@ private:
     std::vector<VkSemaphore> mRenderFinishedSemaphores;
     std::vector<VkFence> mInFlightFences;
 
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
     VkBuffer mVertexBuffer;
     VkDeviceMemory mVertexBufferMemory;
     VkBuffer mIndexBuffer;
@@ -137,78 +210,6 @@ private:
     // The current frame index (incremented every drawn frame, wraps around `MAX_FRAMES_IN_FLIGHT`).
     uint32_t mCurrentFrame = 0;
     bool mFramebufferResized = false;
-
-    struct Vertex {
-        glm::vec3 position;
-        glm::vec3 color;
-        glm::vec2 texCoord;
-
-        static VkVertexInputBindingDescription getBindingDescription()
-        {
-            VkVertexInputBindingDescription bindingDescription {};
-            bindingDescription.binding = 0;
-            bindingDescription.stride = sizeof(Vertex);
-            bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-
-            return bindingDescription;
-        }
-
-        static std::array<VkVertexInputAttributeDescription, 3> getAttributeDescriptions()
-        {
-            std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions {};
-
-            attributeDescriptions[0].binding = 0;
-            attributeDescriptions[0].location = 0;
-            attributeDescriptions[0].format = VK_FORMAT_R32G32B32_SFLOAT;
-            attributeDescriptions[0].offset = offsetof(Vertex, position);
-
-            attributeDescriptions[1].binding = 0;
-            attributeDescriptions[1].location = 1;
-            attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
-            attributeDescriptions[1].offset = offsetof(Vertex, color);
-
-            attributeDescriptions[2].binding = 0;
-            attributeDescriptions[2].location = 2;
-            attributeDescriptions[2].format = VK_FORMAT_R32G32_SFLOAT;
-            attributeDescriptions[2].offset = offsetof(Vertex, texCoord);
-
-            return attributeDescriptions;
-        }
-    };
-
-    struct UniformBufferObject {
-        glm::mat4 model;
-        glm::mat4 view;
-        glm::mat4 projection;
-    };
-
-    const std::vector<Vertex> vertices = {
-        { .position = { -0.5f, -0.5f, 0.0f }, .color = { 1.0f, 0.0f, 0.0f }, .texCoord = { 1.0f, 0.0f } },
-        { .position = { 0.5f, -0.5f, 0.0f }, .color = { 0.0f, 1.0f, 0.0f }, .texCoord = { 0.0f, 0.0f } },
-        { .position = { 0.5f, 0.5f, 0.0f }, .color = { 0.0f, 0.0f, 1.0f }, .texCoord = { 0.0f, 1.0f } },
-        { .position = { -0.5f, 0.5f, 0.0f }, .color = { 1.0f, 1.0f, 1.0f }, .texCoord = { 1.0f, 1.0f } },
-
-        { .position = { -0.5f, -0.5f, -0.5f }, .color = { 1.0f, 0.0f, 0.0f }, .texCoord = { 1.0f, 0.0f } },
-        { .position = { 0.5f, -0.5f, -0.5f }, .color = { 0.0f, 1.0f, 0.0f }, .texCoord = { 0.0f, 0.0f } },
-        { .position = { 0.5f, 0.5f, -0.5f }, .color = { 0.0f, 0.0f, 1.0f }, .texCoord = { 0.0f, 1.0f } },
-        { .position = { -0.5f, 0.5f, -0.5f }, .color = { 1.0f, 1.0f, 1.0f }, .texCoord = { 1.0f, 1.0f } },
-    };
-
-    const std::vector<uint16_t> indices = {
-        0,
-        1,
-        2,
-        2,
-        3,
-        0,
-
-        4,
-        5,
-        6,
-        6,
-        7,
-        4,
-    };
 
     bool checkValidationLayerSupport()
     {
@@ -1076,11 +1077,11 @@ private:
     void createTextureImage()
     {
         int texWidth, texHeight, texChannels;
-        stbi_uc* pixels = stbi_load("texture.jpg", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+        stbi_uc* pixels = stbi_load(TEXTURE_PATH, &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
         VkDeviceSize imageSize = texWidth * texHeight * 4;
 
         if (!pixels) {
-            throw std::runtime_error("Couldn't load image: texture.jpg");
+            throw std::runtime_error("Couldn't load image.");
         }
 
         VkBuffer stagingBuffer;
@@ -1351,6 +1352,51 @@ private:
         endSingleTimeCommands(commandBuffer);
     }
 
+    void loadModel()
+    {
+        tinyobj::attrib_t attrib;
+        std::vector<tinyobj::shape_t> shapes;
+        std::vector<tinyobj::material_t> materials;
+        std::string warning, error;
+
+        if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warning, &error, MODEL_PATH)) {
+            throw std::runtime_error(warning + error);
+        }
+
+        // Key is the vertex data, value is the index.
+        std::unordered_map<Vertex, uint32_t> uniqueVertices {};
+
+        // tinyobj automatically triangulates meshes on load by default.
+        for (const auto& shape : shapes) {
+            for (const auto& index : shape.mesh.indices) {
+                Vertex vertex = {
+                    .position = {
+                        attrib.vertices[3 * index.vertex_index + 0],
+                        attrib.vertices[3 * index.vertex_index + 1],
+                        attrib.vertices[3 * index.vertex_index + 2],
+                    },
+                    .color = { 1.0f, 1.0f, 1.0f },
+                    .texCoord = {
+                        attrib.texcoords[2 * index.texcoord_index + 0],
+                        // In OBJ, 0.0 is the bottom of the image.
+                        // Flip to match Vulkan coordinate system where 0.0 is the top.
+                        1.0f - attrib.texcoords[2 * index.texcoord_index + 1],
+                    },
+                };
+
+                // Every time we read a vertex from the OBJ file, we check if we've already
+                // seen a vertex with the exact same position and texture coordinates.
+                if (uniqueVertices.count(vertex) == 0) {
+                    // Vertex wasn't added yet, so add it.
+                    uniqueVertices[vertex] = static_cast<uint32_t>(vertices.size());
+                    vertices.push_back(vertex);
+                }
+
+                indices.push_back(uniqueVertices[vertex]);
+            }
+        }
+    }
+
     void createVertexBuffer()
     {
         VkDeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
@@ -1561,7 +1607,7 @@ private:
         VkBuffer vertexBuffers[] = { mVertexBuffer };
         VkDeviceSize offsets[] = { 0 };
         vkCmdBindVertexBuffers(pCommandBuffer, 0, 1, vertexBuffers, offsets);
-        vkCmdBindIndexBuffer(pCommandBuffer, mIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
+        vkCmdBindIndexBuffer(pCommandBuffer, mIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
 
         vkCmdBindDescriptorSets(pCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, mPipelineLayout, 0, 1, &mDescriptorSets[mCurrentFrame], 0, nullptr);
 
@@ -1621,6 +1667,7 @@ private:
         createTextureImage();
         createTextureImageView();
         createTextureSampler();
+        loadModel();
         createVertexBuffer();
         createIndexBuffer();
         createUniformBuffers();
