@@ -7,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
@@ -34,6 +35,8 @@ constexpr int WINDOW_HEIGHT = 600;
 constexpr int MAX_FRAMES_IN_FLIGHT = 2;
 constexpr const char* MODEL_PATH = "viking_room.obj";
 constexpr const char* TEXTURE_PATH = "viking_room.png";
+constexpr int PARTICLE_COUNT = 1'000;
+constexpr float PI = 3.1415926535f;
 
 const std::vector<const char*> validationLayers = {
     "VK_LAYER_KHRONOS_validation",
@@ -161,12 +164,19 @@ private:
         glm::mat4 projection;
     };
 
+    struct Particle {
+        glm::vec2 position;
+        glm::vec2 velocity;
+        glm::vec4 color;
+    };
+
     GLFWwindow* mWindow;
     VkInstance mInstance;
     VkDebugUtilsMessengerEXT mDebugMessenger;
     VkPhysicalDevice mPhysicalDevice = VK_NULL_HANDLE;
     VkDevice mDevice;
     VkQueue mGraphicsQueue;
+    VkQueue mComputeQueue;
     VkQueue mPresentQueue;
     VkSurfaceKHR mSurface;
     VkSwapchainKHR mSwapChain;
@@ -176,12 +186,16 @@ private:
     std::vector<VkImageView> mSwapChainImageViews;
     VkRenderPass mRenderPass;
     VkDescriptorSetLayout mDescriptorSetLayout;
+    VkDescriptorSetLayout mComputeDescriptorSetLayout;
     VkPipelineLayout mPipelineLayout;
+    VkPipelineLayout mComputePipelineLayout;
     VkPipeline mGraphicsPipeline;
+    VkPipeline mComputePipeline;
     std::vector<VkFramebuffer> mSwapChainFramebuffers;
     VkCommandPool mCommandPool;
     VkDescriptorPool mDescriptorPool;
     std::vector<VkDescriptorSet> mDescriptorSets;
+    std::vector<VkDescriptorSet> mComputeDescriptorSets;
     std::vector<VkCommandBuffer> mCommandBuffers;
     std::vector<VkSemaphore> mImageAvailableSemaphores;
     std::vector<VkSemaphore> mRenderFinishedSemaphores;
@@ -193,6 +207,9 @@ private:
     VkDeviceMemory mVertexBufferMemory;
     VkBuffer mIndexBuffer;
     VkDeviceMemory mIndexBufferMemory;
+
+    std::vector<VkBuffer> mShaderStorageBuffers;
+    std::vector<VkDeviceMemory> mShaderStorageBuffersMemory;
 
     uint32_t mMipLevels;
     VkImage mTextureImage;
@@ -430,12 +447,12 @@ private:
     }
 
     struct QueueFamilyIndices {
-        std::optional<uint32_t> graphicsFamily;
+        std::optional<uint32_t> graphicsAndComputeFamily;
         std::optional<uint32_t> presentFamily;
 
         bool isComplete() const
         {
-            return graphicsFamily.has_value() && presentFamily.has_value();
+            return graphicsAndComputeFamily.has_value() && presentFamily.has_value();
         }
     };
 
@@ -450,8 +467,8 @@ private:
 
         int i = 0;
         for (const auto& queueFamily : queueFamilies) {
-            if (queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-                indices.graphicsFamily = i;
+            if ((queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT) && (queueFamily.queueFlags & VK_QUEUE_COMPUTE_BIT)) {
+                indices.graphicsAndComputeFamily = i;
             }
 
             VkBool32 presentSupport = false;
@@ -546,7 +563,7 @@ private:
         const QueueFamilyIndices indices = findQueueFamilies(mPhysicalDevice);
 
         std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
-        const std::set<uint32_t> uniqueQueueFamilies = { indices.graphicsFamily.value(), indices.presentFamily.value() };
+        const std::set<uint32_t> uniqueQueueFamilies = { indices.graphicsAndComputeFamily.value(), indices.presentFamily.value() };
         const float queuePriority = 1.0f;
         for (uint32_t queueFamily : uniqueQueueFamilies) {
             VkDeviceQueueCreateInfo queueCreateInfo {};
@@ -583,7 +600,8 @@ private:
         }
 
         // We're only creating a single queue from these families, so use index 0.
-        vkGetDeviceQueue(mDevice, indices.graphicsFamily.value(), 0, &mGraphicsQueue);
+        vkGetDeviceQueue(mDevice, indices.graphicsAndComputeFamily.value(), 0, &mGraphicsQueue);
+        vkGetDeviceQueue(mDevice, indices.graphicsAndComputeFamily.value(), 0, &mComputeQueue);
         vkGetDeviceQueue(mDevice, indices.presentFamily.value(), 0, &mPresentQueue);
     }
 
@@ -621,9 +639,9 @@ private:
         createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
         QueueFamilyIndices indices = findQueueFamilies(mPhysicalDevice);
-        uint32_t queueFamilyIndices[] = { indices.graphicsFamily.value(), indices.presentFamily.value() };
+        uint32_t queueFamilyIndices[] = { indices.graphicsAndComputeFamily.value(), indices.presentFamily.value() };
 
-        if (indices.graphicsFamily != indices.presentFamily) {
+        if (indices.graphicsAndComputeFamily != indices.presentFamily) {
             std::cout << "Using concurrent sharing mode.\n";
             createInfo.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
             createInfo.queueFamilyIndexCount = 2;
@@ -721,6 +739,44 @@ private:
         }
 
         return shaderModule;
+    }
+
+    void createShaderStorageBuffers()
+    {
+        mShaderStorageBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+        mShaderStorageBuffersMemory.resize(MAX_FRAMES_IN_FLIGHT);
+
+        // Initialize particles.
+        std::default_random_engine rndEngine((unsigned)time(nullptr));
+        std::uniform_real_distribution<float> rndDist(0.0f, 1.0f);
+
+        // Initialize particle positions on a circle.
+        std::vector<Particle> particles(PARTICLE_COUNT);
+        for (auto& particle : particles) {
+            const float r = 0.25f * sqrt(rndDist(rndEngine));
+            const float theta = rndDist(rndEngine) * 2 * PI;
+            const float x = r * cos(theta) * WINDOW_HEIGHT / WINDOW_WIDTH;
+            const float y = r * sin(theta);
+            particle.position = glm::vec2(x, y);
+            particle.velocity = glm::normalize(glm::vec2(x, y)) * 0.00025f;
+            particle.color = glm::vec4(rndDist(rndEngine), rndDist(rndEngine), rndDist(rndEngine), 1.0);
+        }
+
+        VkDeviceSize bufferSize = sizeof(Particle) * PARTICLE_COUNT;
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingBufferMemory;
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+
+        void* data;
+        vkMapMemory(mDevice, stagingBufferMemory, 0, bufferSize, 0, &data);
+        memcpy(data, particles.data(), (size_t)bufferSize);
+        vkUnmapMemory(mDevice, stagingBufferMemory);
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i += 1) {
+            createBuffer(bufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, mShaderStorageBuffers[i], mShaderStorageBuffersMemory[i]);
+            // Copy data from the staging buffer (host) to the shader storage buffer (GPU).
+            copyBuffer(stagingBuffer, mShaderStorageBuffers[i], bufferSize);
+        }
     }
 
     void createRenderPass()
@@ -827,7 +883,48 @@ private:
         layoutInfo.pBindings = bindings.data();
 
         if (vkCreateDescriptorSetLayout(mDevice, &layoutInfo, nullptr, &mDescriptorSetLayout) != VK_SUCCESS) {
-            throw std::runtime_error("Couldn't create Vulkan descriptor set layout.");
+            throw std::runtime_error("Couldn't create Vulkan graphics descriptor set layout.");
+        }
+
+        const std::array<VkDescriptorSetLayoutBinding, 3> layoutBindings = { {
+            {
+                .binding = 0,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+            {
+                .binding = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+            // We need two SSBOs, as particle positions are updated
+            // frame-by-frame based on delta time. This means that each frame
+            // needs to know about the last frames' particle positions, so it
+            // can update them with a new delta time and write them to its own
+            // SSBO.
+            {
+                .binding = 2,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+        } };
+
+        const VkDescriptorSetLayoutCreateInfo computeLayoutInfo = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = {},
+            .bindingCount = 3,
+            .pBindings = layoutBindings.data(),
+        };
+
+        if (vkCreateDescriptorSetLayout(mDevice, &computeLayoutInfo, nullptr, &mComputeDescriptorSetLayout) != VK_SUCCESS) {
+            throw std::runtime_error("Couldn't create Vulkan compute descriptor set layout.");
         }
     }
 
@@ -835,9 +932,11 @@ private:
     {
         auto vertShaderCode = readFile("build/shader.vert.spv");
         auto fragShaderCode = readFile("build/shader.frag.spv");
+        auto computeShaderCode = readFile("build/compute.spv");
 
         VkShaderModule vertShaderModule = createShaderModule(vertShaderCode);
         VkShaderModule fragShaderModule = createShaderModule(fragShaderCode);
+        VkShaderModule computeShaderModule = createShaderModule(computeShaderCode);
 
         VkPipelineShaderStageCreateInfo vertShaderStageInfo {};
         vertShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -851,7 +950,13 @@ private:
         fragShaderStageInfo.module = fragShaderModule;
         fragShaderStageInfo.pName = "main";
 
-        VkPipelineShaderStageCreateInfo shaderStages[] = { vertShaderStageInfo, fragShaderStageInfo };
+        VkPipelineShaderStageCreateInfo computeShaderStageInfo {};
+        computeShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        computeShaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        computeShaderStageInfo.module = computeShaderModule;
+        computeShaderStageInfo.pName = "main";
+
+        VkPipelineShaderStageCreateInfo shaderStages[] = { vertShaderStageInfo, fragShaderStageInfo, computeShaderStageInfo };
 
         VkPipelineVertexInputStateCreateInfo vertexInputInfo {};
         vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
@@ -944,6 +1049,20 @@ private:
             throw std::runtime_error("Couldn't create Vulkan pipeline layout.");
         }
 
+        VkPipelineLayoutCreateInfo computePipelineLayoutInfo = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = {},
+            .setLayoutCount = 1,
+            .pSetLayouts = &mComputeDescriptorSetLayout,
+            .pushConstantRangeCount = {},
+            .pPushConstantRanges = nullptr,
+        };
+
+        if (vkCreatePipelineLayout(mDevice, &computePipelineLayoutInfo, nullptr, &mComputePipelineLayout) != VK_SUCCESS) {
+            throw std::runtime_error("Couldn't create Vulkan compute pipeline layout.");
+        }
+
         VkGraphicsPipelineCreateInfo pipelineInfo {};
         pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
         pipelineInfo.stageCount = 2;
@@ -966,6 +1085,20 @@ private:
 
         if (vkCreateGraphicsPipelines(mDevice, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &mGraphicsPipeline) != VK_SUCCESS) {
             throw std::runtime_error("Couldn't create Vulkan graphics pipeline.");
+        }
+
+        const VkComputePipelineCreateInfo computePipelineInfo = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = {},
+            .stage = computeShaderStageInfo,
+            .layout = mComputePipelineLayout,
+            .basePipelineHandle = {},
+            .basePipelineIndex = {},
+        };
+
+        if (vkCreateComputePipelines(mDevice, VK_NULL_HANDLE, 1, &computePipelineInfo, nullptr, &mComputePipeline) != VK_SUCCESS) {
+            throw std::runtime_error("Couldn't create Vulkan compute pipeline.");
         }
 
         // Shader modules don't need to exist after the pipeline has been compiled,
@@ -1009,7 +1142,7 @@ private:
         VkCommandPoolCreateInfo poolInfo {};
         poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-        poolInfo.queueFamilyIndex = queueFamilyIndices.graphicsFamily.value();
+        poolInfo.queueFamilyIndex = queueFamilyIndices.graphicsAndComputeFamily.value();
 
         if (vkCreateCommandPool(mDevice, &poolInfo, nullptr, &mCommandPool) != VK_SUCCESS) {
             throw std::runtime_error("Couldn't create Vulkan command pool.");
@@ -1665,8 +1798,11 @@ private:
         std::array<VkDescriptorPoolSize, 2> poolSizes {};
         poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         poolSizes[0].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
-        poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        poolSizes[1].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        // We need to double the number of `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER`
+        // types requested from the pool by two because our sets reference the
+        // SSBOs of the last and current frame.
+        poolSizes[1].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT) * 2;
 
         VkDescriptorPoolCreateInfo poolInfo {};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1702,11 +1838,6 @@ private:
             // range.
             bufferInfo.range = sizeof(UniformBufferObject);
 
-            VkDescriptorImageInfo imageInfo {};
-            imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            imageInfo.imageView = mTextureImageView;
-            imageInfo.sampler = mTextureSampler;
-
             std::array<VkWriteDescriptorSet, 2> descriptorWrites {};
             descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             descriptorWrites[0].dstSet = mDescriptorSets[i];
@@ -1716,14 +1847,33 @@ private:
             descriptorWrites[0].descriptorCount = 1;
             descriptorWrites[0].pBufferInfo = &bufferInfo;
 
+            const VkDescriptorBufferInfo storageBufferInfoLastFrame = {
+                .buffer = mShaderStorageBuffers[(i - 1) % MAX_FRAMES_IN_FLIGHT],
+                .offset = 0,
+                .range = sizeof(Particle) * PARTICLE_COUNT,
+            };
+
             descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            descriptorWrites[1].dstSet = mDescriptorSets[i];
+            descriptorWrites[1].dstSet = mComputeDescriptorSets[i];
             descriptorWrites[1].dstBinding = 1;
             descriptorWrites[1].dstArrayElement = 0;
-            descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             descriptorWrites[1].descriptorCount = 1;
-            descriptorWrites[1].pImageInfo = &imageInfo;
-            descriptorWrites[1].pTexelBufferView = nullptr; // Optional
+            descriptorWrites[1].pBufferInfo = &storageBufferInfoLastFrame;
+
+            const VkDescriptorBufferInfo storageBufferInfoCurrentFrame = {
+                .buffer = mShaderStorageBuffers[i],
+                .offset = 0,
+                .range = sizeof(Particle) * PARTICLE_COUNT,
+            };
+
+            descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrites[1].dstSet = mComputeDescriptorSets[i];
+            descriptorWrites[1].dstBinding = 2;
+            descriptorWrites[1].dstArrayElement = 0;
+            descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            descriptorWrites[1].descriptorCount = 1;
+            descriptorWrites[1].pBufferInfo = &storageBufferInfoCurrentFrame;
 
             vkUpdateDescriptorSets(mDevice, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
         }
@@ -1847,6 +1997,7 @@ private:
         createDescriptorSetLayout();
         createGraphicsPipeline();
         createCommandPool();
+        createShaderStorageBuffers(); // Must occur after creating the command pool.
         createColorResources();
         createDepthResources();
         createFramebuffers(); // Must occur after creating color and depth resources.
